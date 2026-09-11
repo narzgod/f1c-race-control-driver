@@ -322,20 +322,25 @@ function DriverLoginView({ onSuccess, lobbyOpen, registerDriver }) {
 /* ---------------------------------------------------------------------- */
 
 function DriverConsole({ driver, signals, onExit }) {
-  // Signals stack in place (same top-0 slot) instead of listing downward -
-  // whichever was activated most recently is rendered last, so it naturally
-  // paints on top and fully covers any earlier active panel underneath it.
+  // Signals stack in ONE shared slot (not a list) - whichever was activated
+  // most recently is rendered last, so it naturally paints on top and fully
+  // covers whatever was active before it (e.g. activating YELLOW FLAG while
+  // RED LIGHT is showing replaces it completely, not side-by-side). This
+  // relies on every frame being fully OPAQUE: Frame A uses its configured
+  // color, and Frame B uses a solid near-black fill (matching the page
+  // background, so it still reads as "no background") instead of literal
+  // CSS transparent - a truly transparent Frame B would let whatever is
+  // behind it show through and visually collide with its text.
   const bannerHeight = 96;
 
   // Every active signal alternates between two "frames" every 700ms:
   //   Frame A - the main label, shown with its configured background color
-  //   Frame B - a secondary line, shown with NO background (transparent)
+  //   Frame B - a secondary line, shown with a plain black fill (no color)
   // For driver-targeted flags/penalties, Frame A is the driver's name and
-  // Frame B is the flag/penalty name (penalties get wrapped in parentheses,
-  // e.g. "M.VERSTAPPEN" -> "(5 SEC TIME PENALTY)"). For everything else,
-  // Frame A is the item name and Frame B is its configured Secondary Text
-  // (e.g. RED LIGHT -> BE READY), falling back to repeating the item name
-  // if no Secondary Text was set by the admin.
+  // Frame B is the flag/penalty name (e.g. "M.VERSTAPPEN" -> "5 SEC TIME
+  // PENALTY"). For everything else, Frame A is the item name and Frame B is
+  // its configured Secondary Text (e.g. RED LIGHT -> BE READY), falling
+  // back to repeating the item name if no Secondary Text was set by admin.
   const [frame, setFrame] = useState(0);
 
   useEffect(() => {
@@ -353,25 +358,23 @@ function DriverConsole({ driver, signals, onExit }) {
 
           const primaryText = isTargeted ? s.driverName : s.name;
           const secondaryText = isTargeted
-            ? s.section === "penalties"
-              ? `(${s.name})`
-              : s.name
+            ? s.name
             : s.subText && s.subText.trim()
             ? s.subText
             : s.name;
 
           // Custom text color always wins if the admin set one. Otherwise,
           // Frame A uses the palette's readable text color, and Frame B uses
-          // the item's own accent color as text on the black page background
-          // - except for "black", which would be invisible on the black
-          // background, so that one case falls back to white.
+          // the item's own accent color as text on the black banner fill -
+          // except for "black", which would be invisible on a black fill,
+          // so that one case falls back to white.
           const customColor = s.textColor && s.textColor.trim() ? s.textColor : null;
           const frameAColor = customColor || palette.text;
           const frameBColor = customColor || (s.color === "black" ? "#FFFFFF" : palette.bg);
 
           const showingPrimary = frame === 0;
           const displayText = showingPrimary ? primaryText : secondaryText;
-          const displayBg = showingPrimary ? palette.bg : "transparent";
+          const displayBg = showingPrimary ? palette.bg : INK;
           const displayColor = showingPrimary ? frameAColor : frameBColor;
 
           const textOutline = {
@@ -383,7 +386,7 @@ function DriverConsole({ driver, signals, onExit }) {
             <div
               key={s.uid}
               className="absolute inset-0 w-full h-full py-3 px-5 flex flex-col items-center justify-center gap-0.5"
-              style={{ background: displayBg, borderBottom: `1px solid #000` }}
+              style={{ background: displayBg, borderBottom: "1px solid #000" }}
             >
               <p
                 className="font-semibold uppercase text-center"
@@ -462,6 +465,10 @@ export default function F1CDriverApp() {
   const [currentDriver, setCurrentDriver] = useState(null);
   const stateRef = useRef(state);
   stateRef.current = state;
+  // Chains every Firebase write onto the previous one so they always
+  // resolve in the same order requested, no matter how the network
+  // delivers them. See mutate() below for why this matters.
+  const writeQueueRef = useRef(Promise.resolve());
 
   useEffect(() => {
     const unsubscribe = subscribeToState(
@@ -500,19 +507,31 @@ export default function F1CDriverApp() {
     }
   }, [state.drivers, view, currentDriver]);
 
-  const mutate = useCallback(async (partial) => {
+  const mutate = useCallback((partial) => {
     const merged = { ...stateRef.current, ...partial, updatedAt: Date.now() };
-    // Apply instantly and locally first so registration feels immediate;
-    // the Firebase echo will confirm the same data a moment later.
+    // Apply instantly and locally first so registration feels immediate,
+    // even while a previous save is still in flight.
     setState(merged);
     stateRef.current = merged;
-    try {
-      await saveState(merged);
-      setConnError(null);
-    } catch (e) {
-      setConnError(e.message || String(e));
-      throw e;
-    }
+
+    // The actual network write is queued rather than fired immediately, so
+    // writes always land at Firebase in the order they were requested -
+    // otherwise an older, now-stale write landing after a newer one could
+    // silently overwrite it.
+    const run = () => saveState(merged);
+    const queued = writeQueueRef.current.then(run, run);
+    writeQueueRef.current = queued.then(
+      () => {},
+      () => {}
+    );
+
+    return queued.then(
+      () => setConnError(null),
+      (e) => {
+        setConnError(e.message || String(e));
+        throw e;
+      }
+    );
   }, []);
 
   const registerDriver = useCallback(
